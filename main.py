@@ -1,7 +1,8 @@
 import os
 import aiohttp
 import asyncio
-import aiosqlite
+import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
@@ -29,50 +30,69 @@ def _openweather_api_key() -> str:
 class DB:
     def __init__(self, path: str):
         self.path = path
+        # SQLite is sync; keep it off the event loop.
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="db")
+
+    async def _run(self, fn, *args):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._executor, lambda: fn(*args))
 
     async def init(self) -> None:
-        async with aiosqlite.connect(self.path) as db:
-            await db.execute(
-                """
-                CREATE TABLE IF NOT EXISTS cities (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL,
-                    city TEXT NOT NULL,
-                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                    UNIQUE(user_id, city)
+        def _init_sync(path: str) -> None:
+            with sqlite3.connect(path) as db:
+                db.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS cities (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id INTEGER NOT NULL,
+                        city TEXT NOT NULL,
+                        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                        UNIQUE(user_id, city)
+                    )
+                    """
                 )
-                """
-            )
-            await db.commit()
+                db.commit()
+
+        await self._run(_init_sync, self.path)
 
     async def add_city(self, user_id: int, city: str) -> None:
         city = city.strip()
         if not city:
             return
-        async with aiosqlite.connect(self.path) as db:
-            await db.execute(
-                "INSERT OR IGNORE INTO cities(user_id, city) VALUES(?, ?)",
-                (user_id, city),
-            )
-            await db.commit()
+
+        def _add_sync(path: str, uid: int, c: str) -> None:
+            with sqlite3.connect(path) as db:
+                db.execute(
+                    "INSERT OR IGNORE INTO cities(user_id, city) VALUES(?, ?)",
+                    (uid, c),
+                )
+                db.commit()
+
+        await self._run(_add_sync, self.path, int(user_id), city)
 
     async def list_cities(self, user_id: int) -> list[tuple[int, str]]:
-        async with aiosqlite.connect(self.path) as db:
-            cur = await db.execute(
-                "SELECT id, city FROM cities WHERE user_id = ? ORDER BY created_at ASC, id ASC",
-                (user_id,),
-            )
-            rows = await cur.fetchall()
-            return [(int(r[0]), str(r[1])) for r in rows]
+        def _list_sync(path: str, uid: int) -> list[tuple[int, str]]:
+            with sqlite3.connect(path) as db:
+                cur = db.execute(
+                    "SELECT id, city FROM cities WHERE user_id = ? ORDER BY created_at ASC, id ASC",
+                    (uid,),
+                )
+                rows = cur.fetchall()
+                return [(int(r[0]), str(r[1])) for r in rows]
+
+        return await self._run(_list_sync, self.path, int(user_id))
 
     async def get_city_by_id(self, user_id: int, city_id: int) -> str | None:
-        async with aiosqlite.connect(self.path) as db:
-            cur = await db.execute(
-                "SELECT city FROM cities WHERE user_id = ? AND id = ?",
-                (user_id, city_id),
-            )
-            row = await cur.fetchone()
-            return str(row[0]) if row else None
+        def _get_sync(path: str, uid: int, cid: int) -> str | None:
+            with sqlite3.connect(path) as db:
+                cur = db.execute(
+                    "SELECT city FROM cities WHERE user_id = ? AND id = ?",
+                    (uid, cid),
+                )
+                row = cur.fetchone()
+                return str(row[0]) if row else None
+
+        return await self._run(_get_sync, self.path, int(user_id), int(city_id))
 
 
 class AddCity(StatesGroup):
