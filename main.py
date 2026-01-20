@@ -1,7 +1,10 @@
 import os
-import aiohttp
 import asyncio
+import json
 import sqlite3
+import urllib.error
+import urllib.parse
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 from aiogram import Bot, Dispatcher, F
@@ -116,11 +119,32 @@ async def get_forecast(city: str) -> str:
     url = "https://api.openweathermap.org/data/2.5/forecast"
     params = {"q": city, "appid": api_key, "units": "metric", "lang": "ru"}
 
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            data = await resp.json()
+    def _fetch_forecast_sync() -> tuple[int, dict]:
+        full_url = f"{url}?{urllib.parse.urlencode(params)}"
+        req = urllib.request.Request(
+            full_url,
+            headers={"Accept": "application/json", "User-Agent": "weather-bot/1.0"},
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                status = int(getattr(resp, "status", 200))
+                body = resp.read()
+        except urllib.error.HTTPError as e:
+            status = int(getattr(e, "code", 500))
+            body = e.read()
+        except Exception:
+            return 0, {"message": "network_error"}
 
-    if resp.status != 200:
+        try:
+            data = json.loads(body.decode("utf-8"))
+        except Exception:
+            data = {"message": "bad_json"}
+        return status, data
+
+    status, data = await asyncio.to_thread(_fetch_forecast_sync)
+
+    if status != 200:
         msg = data.get("message", "Неизвестная ошибка API")
         return f"Ошибка OpenWeatherMap: {msg}"
 
