@@ -1,90 +1,212 @@
 import os
 import aiohttp
 import asyncio
-from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+import aiosqlite
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 
 load_dotenv()
 
+def _require_env(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(f"Missing env var: {name}")
+    return value
+
+
+def _openweather_api_key() -> str:
+    # поддержка обоих вариантов имен переменной, чтобы не ломать существующие .env
+    return os.getenv("OPENWEATHER_API_KEY") or _require_env("WEATHER_API_KEY")
+
+
+class DB:
+    def __init__(self, path: str):
+        self.path = path
+
+    async def init(self) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS cities (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    city TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    UNIQUE(user_id, city)
+                )
+                """
+            )
+            await db.commit()
+
+    async def add_city(self, user_id: int, city: str) -> None:
+        city = city.strip()
+        if not city:
+            return
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "INSERT OR IGNORE INTO cities(user_id, city) VALUES(?, ?)",
+                (user_id, city),
+            )
+            await db.commit()
+
+    async def list_cities(self, user_id: int) -> list[tuple[int, str]]:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "SELECT id, city FROM cities WHERE user_id = ? ORDER BY created_at ASC, id ASC",
+                (user_id,),
+            )
+            rows = await cur.fetchall()
+            return [(int(r[0]), str(r[1])) for r in rows]
+
+    async def get_city_by_id(self, user_id: int, city_id: int) -> str | None:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "SELECT city FROM cities WHERE user_id = ? AND id = ?",
+                (user_id, city_id),
+            )
+            row = await cur.fetchone()
+            return str(row[0]) if row else None
+
+
+class AddCity(StatesGroup):
+    waiting_for_city = State()
+
+
+def cities_keyboard(cities: list[tuple[int, str]]) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for city_id, city in cities:
+        kb.button(text=city, callback_data=f"city_id:{city_id}")
+    kb.button(text="Мой город", callback_data="add_city")
+    kb.adjust(2)
+    return kb.as_markup()
+
+
+async def get_forecast(city: str) -> str:
+    """
+    Прогноз на ближайшие ~18 часов (6 точек по 3 часа) через OpenWeatherMap /forecast.
+    """
+    api_key = _openweather_api_key()
+    url = "https://api.openweathermap.org/data/2.5/forecast"
+    params = {"q": city, "appid": api_key, "units": "metric", "lang": "ru"}
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            data = await resp.json()
+
+    if resp.status != 200:
+        msg = data.get("message", "Неизвестная ошибка API")
+        return f"Ошибка OpenWeatherMap: {msg}"
+
+    city_name = data.get("city", {}).get("name") or city
+    items = data.get("list") or []
+    if not items:
+        return f"Не удалось получить прогноз для {city_name}."
+
+    lines: list[str] = [f"Прогноз для {city_name} (ближайшие часы):"]
+    for item in items[:6]:
+        dt_txt = item.get("dt_txt", "")
+        time_part = dt_txt[11:16] if len(dt_txt) >= 16 else dt_txt
+        main = item.get("main") or {}
+        temp = main.get("temp")
+        feels = main.get("feels_like")
+        wind = (item.get("wind") or {}).get("speed")
+        desc = ((item.get("weather") or [{}])[0]).get("description", "")
+
+        t = f"{round(temp)}°C" if isinstance(temp, (int, float)) else "—"
+        f = f"{round(feels)}°C" if isinstance(feels, (int, float)) else "—"
+        w = f"{wind} м/с" if isinstance(wind, (int, float)) else "—"
+        d = desc.capitalize() if isinstance(desc, str) and desc else "—"
+
+        lines.append(f"{time_part}: {t} (ощущается {f}), {d}, ветер {w}")
+
+    return "\n".join(lines)
+
+
 class WeatherBot:
     def __init__(self):
-        self.bot = Bot(token=os.getenv("TELEGRAM_TOKEN"))
-        self.dp = Dispatcher()
-        
-        # Регистрация обработчиков
-        self.dp.message.register(self.cmd_start, Command("start", "help"))
-        self.dp.message.register(self.handle_city_button, self.city_filter)
-        self.dp.message.register(self.handle_other_cities)
+        self.bot = Bot(token=_require_env("TELEGRAM_TOKEN"))
+        self.dp = Dispatcher(storage=MemoryStorage())
+        self.db = DB(path=os.getenv("DB_PATH") or "cities.db")
 
-    # Создаем клавиатуру с городами
-        self.city_keyboard = ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text="Екатеринбург"), KeyboardButton(text="Сочи")],
-                [KeyboardButton(text="Арамиль"), KeyboardButton(text="Калининград")],
-                [KeyboardButton(text="Мой город")]  # Для ручного ввода
-            ],
-            resize_keyboard=True,
-            input_field_placeholder="Выберите город"
-        )
+        self.dp.message.register(self.start, CommandStart())
+        self.dp.message.register(self.help, Command("help"))
+        self.dp.message.register(self.weather_menu, Command("weather"))
 
-    def city_filter(self, message: types.Message) -> bool:
-        """Фильтр для обработки кнопок городов"""
-        return message.text in ["Екатеринбург", "Сочи", "Арамиль", "Калининград"]
+        self.dp.callback_query.register(self.on_add_city, F.data == "add_city")
+        self.dp.callback_query.register(self.on_city_selected, F.data.startswith("city_id:"))
 
-    async def get_weather(self, city: str) -> str:
-        """Запрос погоды через OpenWeatherMap API"""
-        try:
-            async with aiohttp.ClientSession() as session:
-                url = f"http://api.openweathermap.org/data/2.5/weather?q={city}&appid={os.getenv('WEATHER_API_KEY')}&units=metric&lang=ru"
-                async with session.get(url) as resp:
-                    data = await resp.json()
-                    if resp.status != 200:
-                        return f"Ошибка: {data.get('message', 'Неизвестная ошибка API')}"
-                    temp = data["main"]["temp"]
-                    feels_like = data["main"]["feels_like"]
-                    wind = data["wind"]["speed"]
-                    description = data["weather"][0]["description"]
-                    return (
-                        f"🌤 Погода в {city}:\n"
-                        f"• {description.capitalize()}\n"
-                        f"• Температура: {temp}°C (ощущается как {feels_like}°C)\n"
-                        f"• Ветер: {wind} м/с"
-                    )
-        except Exception as e:
-            return f"❌ Ошибка: {str(e)}"
+        self.dp.message.register(self.on_city_text, AddCity.waiting_for_city)
 
-    async def cmd_start(self, message: types.Message):
-        """Обработчик команд /start и /help"""
-        await message.answer(
-            "Выберите город из списка или введите название вручную:",
-            reply_markup=self.city_keyboard
-        )
-
-    async def handle_city_button(self, message: types.Message):
-        """Обработчик кнопок с городами"""
-        try:
-            weather = await self.get_weather(message.text)
-            await message.answer(weather, reply_markup=self.city_keyboard)
-        except Exception as e:
-            await message.answer(f"🚫 Ошибка: {str(e)}")
-
-    async def handle_other_cities(self, message: types.Message):
-        """Обработчик ручного ввода города"""
-        if message.text == "Мой город":
-            await message.answer("Введите название вашего города:")
+    async def start(self, message: Message, state: FSMContext):
+        await state.clear()
+        cities = await self.db.list_cities(message.from_user.id)
+        if not cities:
+            await state.set_state(AddCity.waiting_for_city)
+            await message.answer("Привет! Напиши город, для которого нужен прогноз. Я сохраню его для следующих запросов.")
             return
-        
+
+        await message.answer("Выберите город:", reply_markup=cities_keyboard(cities))
+
+    async def help(self, message: Message):
+        await message.answer("Команды:\n/start — выбрать/добавить город\n/weather — показать список городов")
+
+    async def weather_menu(self, message: Message, state: FSMContext):
+        await state.clear()
+        cities = await self.db.list_cities(message.from_user.id)
+        if not cities:
+            await state.set_state(AddCity.waiting_for_city)
+            await message.answer("У вас пока нет сохранённых городов. Напишите город, и я сохраню его.")
+            return
+        await message.answer("Ваши города:", reply_markup=cities_keyboard(cities))
+
+    async def on_add_city(self, cq: CallbackQuery, state: FSMContext):
+        await state.set_state(AddCity.waiting_for_city)
+        await cq.message.answer("Введите название вашего города:")
+        await cq.answer()
+
+    async def on_city_selected(self, cq: CallbackQuery, state: FSMContext):
+        await state.clear()
+        raw = (cq.data or "").split("city_id:", 1)[-1].strip()
         try:
-            weather = await self.get_weather(message.text)
-            await message.answer(weather, reply_markup=self.city_keyboard)
-        except Exception as e:
-            await message.answer(f"🚫 Ошибка: {str(e)}")
+            city_id = int(raw)
+        except ValueError:
+            await cq.answer("Некорректная кнопка", show_alert=True)
+            return
+
+        city = await self.db.get_city_by_id(cq.from_user.id, city_id)
+        if not city:
+            await cq.answer("Город не найден (возможно, список устарел)", show_alert=True)
+            return
+
+        text = await get_forecast(city)
+        cities = await self.db.list_cities(cq.from_user.id)
+        await cq.message.answer(text, reply_markup=cities_keyboard(cities))
+        await cq.answer()
+
+    async def on_city_text(self, message: Message, state: FSMContext):
+        city = (message.text or "").strip()
+        if not city:
+            await message.answer("Пожалуйста, введите название города текстом.")
+            return
+
+        await self.db.add_city(message.from_user.id, city)
+        await state.clear()
+
+        text = await get_forecast(city)
+        cities = await self.db.list_cities(message.from_user.id)
+        await message.answer(text, reply_markup=cities_keyboard(cities))
 
     async def run(self):
+        await self.db.init()
         await self.dp.start_polling(self.bot)
 
+
 if __name__ == "__main__":
-    bot = WeatherBot()
-    asyncio.run(bot.run())
+    asyncio.run(WeatherBot().run())
