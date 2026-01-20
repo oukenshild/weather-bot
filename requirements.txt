@@ -1,2 +1,1 @@
-aiogram
-python-dotenv
+# No external dependencies required (stdlib only).
