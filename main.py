@@ -5,6 +5,7 @@ import sqlite3
 import urllib.error
 import urllib.parse
 import urllib.request
+import logging
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 
@@ -44,6 +45,26 @@ def load_env_file(path: str = ".env") -> None:
 
 
 load_env_file()
+
+
+# Setup logging
+def setup_logging():
+    """Configure logging for the bot."""
+    log_dir = "logs"
+    os.makedirs(log_dir, exist_ok=True)
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(os.path.join(log_dir, 'bot.log'), encoding='utf-8'),
+            logging.StreamHandler()  # Also log to console
+        ]
+    )
+    return logging.getLogger(__name__)
+
+
+logger = setup_logging()
 
 
 class DB:
@@ -253,13 +274,21 @@ def _command_name(text: str) -> str:
 
 
 async def run_bot() -> None:
-    token = _require_env("TELEGRAM_TOKEN")
-    api = TelegramAPI(token)
-    db = DB(path=os.getenv("DB_PATH") or "cities.db")
-    await db.init()
+    try:
+        token = _require_env("TELEGRAM_TOKEN")
+        logger.info("Starting Telegram Weather Bot...")
+        api = TelegramAPI(token)
+        db_path = os.getenv("DB_PATH") or "cities.db"
+        db = DB(path=db_path)
+        await db.init()
+        logger.info(f"Database initialized at {db_path}")
 
-    awaiting_city: set[int] = set()
-    offset = 0
+        awaiting_city: set[int] = set()
+        offset = 0
+        logger.info("Bot is running and waiting for updates...")
+    except Exception as e:
+        logger.error(f"Failed to initialize bot: {e}", exc_info=True)
+        raise
 
     async def send_menu(chat_id: int, user_id: int, title: str = "Выберите город:") -> None:
         cities = await db.list_cities(user_id)
@@ -346,10 +375,20 @@ async def run_bot() -> None:
                         continue
 
                     await api.answer_callback(callback_id)
-        except Exception:
+        except KeyboardInterrupt:
+            logger.info("Bot stopped by user")
+            raise
+        except Exception as e:
+            logger.error(f"Error processing update: {e}", exc_info=True)
             # небольшая пауза на случай временных сетевых ошибок
             await asyncio.sleep(2)
 
 
 if __name__ == "__main__":
-    asyncio.run(run_bot())
+    try:
+        asyncio.run(run_bot())
+    except KeyboardInterrupt:
+        logger.info("Bot shutdown complete")
+    except Exception as e:
+        logger.error(f"Fatal error: {e}", exc_info=True)
+        raise

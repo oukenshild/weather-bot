@@ -1,0 +1,17 @@
+[Unit]
+Description=Telegram Weather Bot
+After=network.target
+
+[Service]
+Type=simple
+User=YOUR_BEGET_USERNAME
+WorkingDirectory=/home/YOUR_BEGET_USERNAME/weather-bot
+Environment="PATH=/usr/bin:/usr/local/bin"
+ExecStart=/usr/bin/python3 /home/YOUR_BEGET_USERNAME/weather-bot/main.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/home/YOUR_BEGET_USERNAME/weather-bot/logs/bot.log
+StandardError=append:/home/YOUR_BEGET_USERNAME/weather-bot/logs/bot_error.log
+
+[Install]
+WantedBy=multi-user.target
